@@ -126,10 +126,14 @@ class OpenAILLM(LLMBase):
             params.update(**openrouter_params)
         
         else:
-            openai_specific_generation_params = ["store"]
-            for param in openai_specific_generation_params:
-                if hasattr(self.config, param):
-                    params[param] = getattr(self.config, param)
+            # Only add OpenAI-specific params when using actual OpenAI API
+            base_url = self.config.openai_base_url or os.getenv("OPENAI_BASE_URL") or ""
+            is_openai = "api.openai.com" in base_url or not base_url
+            if is_openai:
+                openai_specific_generation_params = ["store"]
+                for param in openai_specific_generation_params:
+                    if hasattr(self.config, param):
+                        params[param] = getattr(self.config, param)
             
         if response_format:
             params["response_format"] = response_format
