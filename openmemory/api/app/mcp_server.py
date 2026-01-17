@@ -42,6 +42,23 @@ load_dotenv()
 # Initialize MCP
 mcp = FastMCP("mem0-mcp-server")
 
+ALLOWED_ENTITY_TYPES = {
+    "finding",
+    "function",
+    "address",
+    "component",
+    "hypothesis",
+    "evidence",
+}
+ALLOWED_RELATION_TYPES = {
+    "located_at",
+    "has_evidence",
+    "contradicts",
+    "supports",
+    "part_of",
+    "calls",
+}
+
 # Don't initialize memory client at import time - do it lazily when needed
 def get_memory_client_safe():
     """Get memory client with error handling. Returns None if client cannot be initialized."""
@@ -431,6 +448,204 @@ async def delete_all_memories() -> str:
         logging.exception(f"Error deleting memories: {e}")
         return f"Error deleting memories: {e}"
 
+
+def _parse_graph_attributes(attributes: str):
+    if attributes is None or attributes == "":
+        return {}
+    if isinstance(attributes, dict):
+        return attributes
+    if isinstance(attributes, str):
+        parsed = json.loads(attributes)
+        if not isinstance(parsed, dict):
+            raise ValueError("attributes must be a JSON object")
+        return parsed
+    raise ValueError("attributes must be a JSON object or string")
+
+
+def _get_graph_node_label(memory_client) -> str:
+    node_label = getattr(memory_client.graph, "node_label", "")
+    return node_label or ""
+
+
+@mcp.tool(description="Add an entity to the knowledge graph. Used for structured knowledge like findings, components, functions, etc.")
+async def graph_add_entity(
+    name: str,
+    entity_type: str,
+    attributes: str = "{}",
+) -> str:
+    """Add an entity node to the graph."""
+    uid = user_id_var.get(None)
+    client_name = client_name_var.get(None)
+
+    if not uid or not client_name:
+        return "Error: user_id or client_name not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    entity_type = (entity_type or "").strip().lower()
+    if entity_type not in ALLOWED_ENTITY_TYPES:
+        return f"Error: Invalid entity_type. Allowed: {sorted(ALLOWED_ENTITY_TYPES)}"
+
+    try:
+        attrs = _parse_graph_attributes(attributes)
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        node_label = _get_graph_node_label(memory_client)
+
+        cypher = f"""
+        MERGE (n{node_label} {{name: $name, user_id: $user_id}})
+        ON CREATE SET n.created_at = $now
+        SET n.updated_at = $now, n.entity_type = $entity_type, n += $attributes
+        RETURN n.name AS name
+        """
+        memory_client.graph.graph.query(
+            cypher,
+            params={
+                "name": name,
+                "user_id": uid,
+                "entity_type": entity_type,
+                "attributes": attrs,
+                "now": now,
+            },
+        )
+
+        return json.dumps({"status": "success", "entity": name, "type": entity_type})
+    except Exception as e:
+        logging.exception(f"Error adding entity to graph: {e}")
+        return f"Error adding entity: {e}"
+
+
+@mcp.tool(description="Add a relationship between two entities in the knowledge graph.")
+async def graph_add_relation(
+    from_entity: str,
+    to_entity: str,
+    relation_type: str,
+    attributes: str = "{}",
+) -> str:
+    """Add a relationship between entities."""
+    uid = user_id_var.get(None)
+    if not uid:
+        return "Error: user_id not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    relation_type = (relation_type or "").strip().lower()
+    if relation_type not in ALLOWED_RELATION_TYPES:
+        return f"Error: Invalid relation_type. Allowed: {sorted(ALLOWED_RELATION_TYPES)}"
+
+    try:
+        attrs = _parse_graph_attributes(attributes)
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        node_label = _get_graph_node_label(memory_client)
+
+        cypher = f"""
+        MERGE (a{node_label} {{name: $from_entity, user_id: $user_id}})
+        ON CREATE SET a.created_at = $now
+        SET a.updated_at = $now
+        MERGE (b{node_label} {{name: $to_entity, user_id: $user_id}})
+        ON CREATE SET b.created_at = $now
+        SET b.updated_at = $now
+        MERGE (a)-[r:{relation_type}]->(b)
+        ON CREATE SET r.created_at = $now
+        SET r.updated_at = $now, r += $attributes
+        RETURN type(r) AS relation
+        """
+        memory_client.graph.graph.query(
+            cypher,
+            params={
+                "from_entity": from_entity,
+                "to_entity": to_entity,
+                "user_id": uid,
+                "attributes": attrs,
+                "now": now,
+            },
+        )
+
+        return json.dumps(
+            {
+                "status": "success",
+                "from": from_entity,
+                "to": to_entity,
+                "type": relation_type,
+            }
+        )
+    except Exception as e:
+        logging.exception(f"Error adding relation to graph: {e}")
+        return f"Error adding relation: {e}"
+
+
+@mcp.tool(description="Query the knowledge graph for entities and their relationships.")
+async def graph_query(
+    query: str,
+    limit: int = 10,
+) -> str:
+    """Query graph for entities and relations."""
+    uid = user_id_var.get(None)
+    if not uid:
+        return "Error: user_id not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    if not query:
+        return "Error: query is required"
+
+    try:
+        result = memory_client.graph.search(query, {"user_id": uid}, limit=limit)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logging.exception(f"Error querying graph: {e}")
+        return f"Error querying graph: {e}"
+
+
+@mcp.tool(description="Delete entities from the knowledge graph.")
+async def graph_delete_entity(
+    entity_name: str,
+) -> str:
+    """Delete an entity from the graph."""
+    uid = user_id_var.get(None)
+    if not uid:
+        return "Error: user_id not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    if not entity_name:
+        return "Error: entity_name is required"
+
+    try:
+        node_label = _get_graph_node_label(memory_client)
+        count_query = f"""
+        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
+        RETURN count(n) AS count
+        """
+        count_result = memory_client.graph.graph.query(
+            count_query,
+            params={"name": entity_name, "user_id": uid},
+        )
+        count = count_result[0]["count"] if count_result else 0
+
+        if count == 0:
+            return json.dumps({"status": "not_found", "deleted": 0, "entity": entity_name})
+
+        delete_query = f"""
+        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
+        DETACH DELETE n
+        """
+        memory_client.graph.graph.query(
+            delete_query,
+            params={"name": entity_name, "user_id": uid},
+        )
+
+        return json.dumps({"status": "success", "deleted": count, "entity": entity_name})
+    except Exception as e:
+        logging.exception(f"Error deleting from graph: {e}")
+        return f"Error deleting entity: {e}"
 
 @mcp_router.get("/{client_name}/sse/{user_id}")
 async def handle_sse(request: Request):

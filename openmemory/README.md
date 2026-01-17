@@ -138,6 +138,32 @@ npx @openmemory/install local http://localhost:8765/mcp/<client-name>/sse/<user-
 
 Replace `<client-name>` with the desired client name and `<user-id>` with the value specified in your environment variables.
 
+## Graph Memory (Neo4j)
+
+Graph memory is optional and can be enabled via environment variables on the API service.
+
+Enable it:
+```bash
+export NEO4J_ENABLED=true
+export NEO4J_URL=bolt://localhost:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD=password
+export NEO4J_DATABASE=mem0
+```
+
+Start a local Neo4j instance:
+```bash
+docker run --name neo4j -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/password neo4j:latest
+```
+
+Example MCP tool usage:
+```json
+{"tool": "graph_add_entity", "args": {"name": "USB_CDC_Function", "entity_type": "function", "attributes": "{\"confidence\": 0.9, \"status\": \"verified\"}"}}
+{"tool": "graph_add_relation", "args": {"from_entity": "USB_CDC_Function", "to_entity": "addr_0x8001234", "relation_type": "located_at", "attributes": "{\"source\": \"ghidra\"}"}}
+{"tool": "graph_query", "args": {"query": "USB_CDC_Function", "limit": 10}}
+```
+
 
 ## Project Structure
 

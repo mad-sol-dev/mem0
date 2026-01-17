@@ -359,6 +359,19 @@ def get_default_memory_config():
     )
     print(f"Auto-detected embedder provider: {embedder_provider}")
 
+    graph_store_config = {
+        "provider": "neo4j",
+        "config": {
+            "url": os.environ.get("NEO4J_URL", "bolt://localhost:7687"),
+            "username": os.environ.get("NEO4J_USER", "neo4j"),
+            "password": os.environ.get("NEO4J_PASSWORD", "password"),
+            "database": os.environ.get("NEO4J_DATABASE", "mem0"),
+        },
+    } if os.environ.get("NEO4J_ENABLED", "false").lower() == "true" else {
+        "provider": None,
+        "config": None,
+    }
+
     return {
         "vector_store": {
             "provider": vector_store_provider,
@@ -372,6 +385,7 @@ def get_default_memory_config():
             "provider": embedder_provider,
             "config": embedder_config
         },
+        "graph_store": graph_store_config,
         "version": "v1.1"
     }
 
@@ -470,10 +484,22 @@ def get_memory_client(custom_instructions: str = None):
         if config.get("embedder", {}).get("provider") == "ollama":
             config["embedder"] = _fix_ollama_urls(config["embedder"])
 
+        # Remove disabled graph configuration to avoid invalid provider/config pairs.
+        graph_store = config.get("graph_store")
+        if graph_store and (not graph_store.get("provider") or not graph_store.get("config")):
+            config.pop("graph_store", None)
+
         # ALWAYS parse environment variables in the final config
         # This ensures that even default config values like "env:OPENAI_API_KEY" get parsed
         print("Parsing environment variables in final config...")
         config = _parse_environment_variables(config)
+
+        graph_store = config.get("graph_store")
+        if graph_store and graph_store.get("provider"):
+            safe_graph_config = dict(graph_store.get("config") or {})
+            if "password" in safe_graph_config:
+                safe_graph_config["password"] = "***"
+            print(f"Graph store config: provider={graph_store.get('provider')} config={safe_graph_config}")
 
         # Check if config has changed by comparing hashes
         current_config_hash = _get_config_hash(config)

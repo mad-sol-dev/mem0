@@ -7,17 +7,20 @@ echo ""
 # Aktiviere venv
 source .venv/bin/activate
 
-# Setze Environment-Variablen
-export OPENAI_API_KEY="QX42UVrPAbU7RT1s7fdjnC7Jx3BllXRM"
-export OPENAI_BASE_URL="https://api.mistral.ai/v1"
-
-# Qdrant über VPN
-export QDRANT_HOST="10.8.0.1"
-export QDRANT_PORT="6333"
+# Lade Environment-Variablen aus .env
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . .env
+  set +a
+else
+  echo "⚠️  .env nicht gefunden, starte ohne zusätzliche Variablen"
+fi
 
 # Suppress HuggingFace progress bars (corrupt MCP SSE stream)
-export HF_HUB_DISABLE_PROGRESS_BARS=1
-export TRANSFORMERS_VERBOSITY=error
+# export HF_HUB_DISABLE_PROGRESS_BARS=1
+# export TRANSFORMERS_VERBOSITY=error
+# Ollama handles GPU - no direct CUDA setup needed
 
 # Wechsle ins API-Verzeichnis
 cd openmemory/api
@@ -28,7 +31,7 @@ echo "✓ Working directory: $(pwd)"
 echo ""
 echo "Configuration:"
 echo "  - LLM: Mistral (mistral-medium-latest)"
-echo "  - Embeddings: BGE-M3 (1024 dims, GPU)"
+echo "  - Embeddings: BGE-M3 via Ollama (1024 dims)"
 echo "  - Vector Store: Qdrant (http://10.8.0.1:6333)"
 echo ""
 echo "Starting server on http://0.0.0.0:8765"

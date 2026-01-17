@@ -121,6 +121,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.example
 .venv
 env/
 venv/
@@ -162,6 +163,10 @@ cython_debug/
 
 .ideas.md
 .todos.md
+AGENTS.md
+CLAUDE.md
+test_env.sh
+test_setup.py
 
 # Database
 db
@@ -172,6 +177,13 @@ test-db
 .idea/
 
 .DS_Store
+
+# OpenMemory local config/data
+openmemory/api/config.json
+openmemory/api/openmemory.db
+openmemory/api/.env
+openmemory/ui/.env
+OPENMEMORY_SETUP.md
 
 notebooks/*.yaml
 .ipynb_checkpoints/
