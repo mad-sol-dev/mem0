@@ -466,6 +466,13 @@ def _get_graph_node_label(memory_client) -> str:
     node_label = getattr(memory_client.graph, "node_label", "")
     return node_label or ""
 
+def _safe_embed_text(memory_client, text: str):
+    try:
+        return memory_client.graph.embedding_model.embed(text)
+    except Exception as e:
+        logging.warning(f"Failed to embed text for graph node: {e}")
+        return None
+
 
 @mcp.tool(description="Add an entity to the knowledge graph. Used for structured knowledge like findings, components, functions, etc.")
 async def graph_add_entity(
@@ -492,11 +499,13 @@ async def graph_add_entity(
         attrs = _parse_graph_attributes(attributes)
         now = datetime.datetime.now(datetime.UTC).isoformat()
         node_label = _get_graph_node_label(memory_client)
+        embedding = _safe_embed_text(memory_client, name)
 
         cypher = f"""
         MERGE (n{node_label} {{name: $name, user_id: $user_id}})
         ON CREATE SET n.created_at = $now
         SET n.updated_at = $now, n.entity_type = $entity_type, n += $attributes
+        SET n.embedding = coalesce(n.embedding, $embedding)
         RETURN n.name AS name
         """
         memory_client.graph.graph.query(
@@ -507,6 +516,7 @@ async def graph_add_entity(
                 "entity_type": entity_type,
                 "attributes": attrs,
                 "now": now,
+                "embedding": embedding,
             },
         )
 
@@ -540,14 +550,18 @@ async def graph_add_relation(
         attrs = _parse_graph_attributes(attributes)
         now = datetime.datetime.now(datetime.UTC).isoformat()
         node_label = _get_graph_node_label(memory_client)
+        from_embedding = _safe_embed_text(memory_client, from_entity)
+        to_embedding = _safe_embed_text(memory_client, to_entity)
 
         cypher = f"""
         MERGE (a{node_label} {{name: $from_entity, user_id: $user_id}})
         ON CREATE SET a.created_at = $now
         SET a.updated_at = $now
+        SET a.embedding = coalesce(a.embedding, $from_embedding)
         MERGE (b{node_label} {{name: $to_entity, user_id: $user_id}})
         ON CREATE SET b.created_at = $now
         SET b.updated_at = $now
+        SET b.embedding = coalesce(b.embedding, $to_embedding)
         MERGE (a)-[r:{relation_type}]->(b)
         ON CREATE SET r.created_at = $now
         SET r.updated_at = $now, r += $attributes
@@ -561,6 +575,8 @@ async def graph_add_relation(
                 "user_id": uid,
                 "attributes": attrs,
                 "now": now,
+                "from_embedding": from_embedding,
+                "to_embedding": to_embedding,
             },
         )
 
@@ -596,7 +612,22 @@ async def graph_query(
 
     try:
         result = memory_client.graph.search(query, {"user_id": uid}, limit=limit)
-        return json.dumps(result, indent=2)
+        if result:
+            return json.dumps(result, indent=2)
+
+        node_label = _get_graph_node_label(memory_client)
+        cypher = f"""
+        MATCH (n{node_label} {{user_id: $user_id}})
+        WHERE toLower(n.name) CONTAINS toLower($query)
+        OPTIONAL MATCH (n)-[r]->(m{node_label} {{user_id: $user_id}})
+        RETURN n.name AS source, type(r) AS relationship, m.name AS destination
+        LIMIT $limit
+        """
+        fallback = memory_client.graph.graph.query(
+            cypher,
+            params={"user_id": uid, "query": query, "limit": limit},
+        )
+        return json.dumps(fallback, indent=2)
     except Exception as e:
         logging.exception(f"Error querying graph: {e}")
         return f"Error querying graph: {e}"
@@ -646,6 +677,128 @@ async def graph_delete_entity(
     except Exception as e:
         logging.exception(f"Error deleting from graph: {e}")
         return f"Error deleting entity: {e}"
+
+
+@mcp.tool(description="Update attributes for an existing graph entity.")
+async def graph_update_entity(
+    name: str,
+    attributes: str = "{}",
+) -> str:
+    """Update an entity's attributes (partial update)."""
+    uid = user_id_var.get(None)
+    if not uid:
+        return "Error: user_id not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    if not name:
+        return "Error: name is required"
+
+    try:
+        attrs = _parse_graph_attributes(attributes)
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        node_label = _get_graph_node_label(memory_client)
+        embedding = _safe_embed_text(memory_client, name)
+
+        cypher = f"""
+        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
+        SET n.updated_at = $now, n += $attributes
+        SET n.embedding = coalesce(n.embedding, $embedding)
+        RETURN n.name AS name
+        """
+        result = memory_client.graph.graph.query(
+            cypher,
+            params={
+                "name": name,
+                "user_id": uid,
+                "attributes": attrs,
+                "now": now,
+                "embedding": embedding,
+            },
+        )
+
+        if not result:
+            return json.dumps({"status": "not_found", "updated": 0, "entity": name})
+
+        return json.dumps({"status": "success", "updated": 1, "entity": name})
+    except Exception as e:
+        logging.exception(f"Error updating graph entity: {e}")
+        return f"Error updating entity: {e}"
+
+
+@mcp.tool(description="Backfill missing embeddings for graph entities.")
+async def graph_backfill_embeddings(
+    entity_type: str = None,
+    limit: int = 200,
+) -> str:
+    """Populate missing embeddings for existing nodes."""
+    uid = user_id_var.get(None)
+    if not uid:
+        return "Error: user_id not provided"
+
+    memory_client = get_memory_client_safe()
+    if not memory_client or not memory_client.enable_graph:
+        return "Error: Graph memory is not enabled"
+
+    if limit <= 0:
+        return "Error: limit must be > 0"
+
+    if entity_type:
+        entity_type = entity_type.strip().lower()
+        if entity_type not in ALLOWED_ENTITY_TYPES:
+            return f"Error: Invalid entity_type. Allowed: {sorted(ALLOWED_ENTITY_TYPES)}"
+
+    try:
+        node_label = _get_graph_node_label(memory_client)
+        cypher = f"""
+        MATCH (n{node_label} {{user_id: $user_id}})
+        WHERE n.embedding IS NULL
+        {("AND n.entity_type = $entity_type" if entity_type else "")}
+        RETURN n.name AS name
+        LIMIT $limit
+        """
+        rows = memory_client.graph.graph.query(
+            cypher,
+            params={"user_id": uid, "entity_type": entity_type, "limit": limit},
+        )
+
+        updated = 0
+        for row in rows:
+            name = row.get("name")
+            if not name:
+                continue
+            embedding = _safe_embed_text(memory_client, name)
+            if embedding is None:
+                continue
+            update_cypher = f"""
+            MATCH (n{node_label} {{name: $name, user_id: $user_id}})
+            SET n.embedding = $embedding, n.updated_at = $now
+            RETURN n.name AS name
+            """
+            memory_client.graph.graph.query(
+                update_cypher,
+                params={
+                    "name": name,
+                    "user_id": uid,
+                    "embedding": embedding,
+                    "now": datetime.datetime.now(datetime.UTC).isoformat(),
+                },
+            )
+            updated += 1
+
+        return json.dumps(
+            {
+                "status": "success",
+                "updated": updated,
+                "requested": len(rows),
+                "entity_type": entity_type,
+            }
+        )
+    except Exception as e:
+        logging.exception(f"Error backfilling embeddings: {e}")
+        return f"Error backfilling embeddings: {e}"
 
 @mcp_router.get("/{client_name}/sse/{user_id}")
 async def handle_sse(request: Request):

@@ -10,10 +10,11 @@
       }
     },
     "embedder": {
-      "provider": "ollama",
+      "provider": "openai",
       "config": {
-        "model": "bge-m3",
-        "ollama_base_url": "http://localhost:11434",
+        "model": "mistral-embed",
+        "openai_base_url": "https://api.mistral.ai/v1",
+        "api_key": "env:OPENAI_API_KEY",
         "embedding_dims": 1024
       }
     },
