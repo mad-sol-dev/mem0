@@ -1,18 +1,9 @@
 """
 MCP Server for OpenMemory with resilient memory client handling.
 
-This module implements an MCP (Model Context Protocol) server that provides
-memory operations for OpenMemory. The memory client is initialized lazily
-to prevent server crashes when external dependencies (like Ollama) are
-unavailable. If the memory client cannot be initialized, the server will
-continue running with limited functionality and appropriate error messages.
-
-Key features:
-- Lazy memory client initialization
-- Graceful error handling for unavailable dependencies
-- Fallback to database-only mode when vector store is unavailable
-- Proper logging for debugging connection issues
-- Environment variable parsing for API keys
+Provides 5 standard memory tools: add, search, list, delete, delete_all.
+Graph memory is managed automatically by mem0 internals — no direct graph
+access via MCP tools needed.
 """
 
 import contextvars
@@ -42,23 +33,6 @@ load_dotenv()
 # Initialize MCP
 mcp = FastMCP("mem0-mcp-server")
 
-ALLOWED_ENTITY_TYPES = {
-    "finding",
-    "function",
-    "address",
-    "component",
-    "hypothesis",
-    "evidence",
-}
-ALLOWED_RELATION_TYPES = {
-    "located_at",
-    "has_evidence",
-    "contradicts",
-    "supports",
-    "part_of",
-    "calls",
-}
-
 # Don't initialize memory client at import time - do it lazily when needed
 def get_memory_client_safe():
     """Get memory client with error handling. Returns None if client cannot be initialized."""
@@ -78,83 +52,52 @@ mcp_router = APIRouter(prefix="/mcp")
 # Initialize SSE transport
 sse = SseServerTransport("/mcp/messages/")
 
-@mcp.tool(description="Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevant information which can be useful in the future conversation. This can also be called when the user asks you to remember something. Set infer to False to store the memory verbatim without LLM fact extraction.")
+
+@mcp.tool(description="Add a new memory. Called whenever the user shares information about themselves, their preferences, or anything useful for future conversations. Also called when the user asks to remember something. Set infer=False to store verbatim without LLM fact extraction.")
 async def add_memories(text: str, infer: bool = True) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
-
     if not uid:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
-
-    # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
-
     try:
         db = SessionLocal()
         try:
-            # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-
-            # Check if app is active
             if not app.is_active:
                 return f"Error: App {app.name} is currently paused on OpenMemory. Cannot create new memories."
-
-            response = memory_client.add(text,
-                                         user_id=uid,
-                                         metadata={
-                                            "source_app": "openmemory",
-                                            "mcp_client": client_name,
-                                         },
+            response = memory_client.add(text, user_id=uid,
+                                         metadata={"source_app": "openmemory", "mcp_client": client_name},
                                          infer=infer)
-
-            # Process the response and update database
             if isinstance(response, dict) and 'results' in response:
                 for result in response['results']:
                     memory_id = uuid.UUID(result['id'])
                     memory = db.query(Memory).filter(Memory.id == memory_id).first()
-
                     if result['event'] == 'ADD':
                         if not memory:
-                            memory = Memory(
-                                id=memory_id,
-                                user_id=user.id,
-                                app_id=app.id,
-                                content=result['memory'],
-                                state=MemoryState.active
-                            )
+                            memory = Memory(id=memory_id, user_id=user.id, app_id=app.id,
+                                            content=result['memory'], state=MemoryState.active)
                             db.add(memory)
                         else:
                             memory.state = MemoryState.active
                             memory.content = result['memory']
-
-                        # Create history entry
-                        history = MemoryStatusHistory(
-                            memory_id=memory_id,
-                            changed_by=user.id,
-                            old_state=MemoryState.deleted if memory else None,
-                            new_state=MemoryState.active
-                        )
+                        history = MemoryStatusHistory(memory_id=memory_id, changed_by=user.id,
+                                                      old_state=MemoryState.deleted if memory else None,
+                                                      new_state=MemoryState.active)
                         db.add(history)
-
                     elif result['event'] == 'DELETE':
                         if memory:
                             memory.state = MemoryState.deleted
                             memory.deleted_at = datetime.datetime.now(datetime.UTC)
-                            # Create history entry
-                            history = MemoryStatusHistory(
-                                memory_id=memory_id,
-                                changed_by=user.id,
-                                old_state=MemoryState.active,
-                                new_state=MemoryState.deleted
-                            )
+                            history = MemoryStatusHistory(memory_id=memory_id, changed_by=user.id,
+                                                          old_state=MemoryState.active,
+                                                          new_state=MemoryState.deleted)
                             db.add(history)
-
                 db.commit()
-
             return json.dumps(response)
         finally:
             db.close()
@@ -163,7 +106,7 @@ async def add_memories(text: str, infer: bool = True) -> str:
         return f"Error adding to memory: {e}"
 
 
-@mcp.tool(description="Search through stored memories. This method is called EVERYTIME the user asks anything.")
+@mcp.tool(description="Search through stored memories. Called whenever the user asks anything.")
 async def search_memory(query: str) -> str:
     uid = user_id_var.get(None)
     client_name = client_name_var.get(None)
@@ -171,68 +114,31 @@ async def search_memory(query: str) -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
-
-    # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
-
     try:
         db = SessionLocal()
         try:
-            # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-
-            # Get accessible memory IDs based on ACL
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-
-            filters = {
-                "user_id": uid
-            }
-
+            accessible_memory_ids = [m.id for m in user_memories if check_memory_access_permissions(db, m, app.id)]
+            filters = {"user_id": uid}
             embeddings = memory_client.embedding_model.embed(query, "search")
-
-            hits = memory_client.vector_store.search(
-                query=query, 
-                vectors=embeddings, 
-                limit=10, 
-                filters=filters,
-            )
-
+            hits = memory_client.vector_store.search(query=query, vectors=embeddings, limit=10, filters=filters)
             allowed = set(str(mid) for mid in accessible_memory_ids) if accessible_memory_ids else None
-
             results = []
             for h in hits:
-                # All vector db search functions return OutputData class
-                id, score, payload = h.id, h.score, h.payload
                 if allowed and (h.id is None or h.id not in allowed):
                     continue
-                
-                results.append({
-                    "id": id, 
-                    "memory": payload.get("data"), 
-                    "hash": payload.get("hash"),
-                    "created_at": payload.get("created_at"), 
-                    "updated_at": payload.get("updated_at"), 
-                    "score": score,
-                })
-
-            for r in results: 
-                if r.get("id"): 
-                    access_log = MemoryAccessLog(
-                        memory_id=uuid.UUID(r["id"]),
-                        app_id=app.id,
-                        access_type="search",
-                        metadata_={
-                            "query": query,
-                            "score": r.get("score"),
-                            "hash": r.get("hash"),
-                        },
-                    )
-                    db.add(access_log)
+                results.append({"id": h.id, "memory": h.payload.get("data"), "hash": h.payload.get("hash"),
+                                 "created_at": h.payload.get("created_at"), "updated_at": h.payload.get("updated_at"),
+                                 "score": h.score})
+            for r in results:
+                if r.get("id"):
+                    db.add(MemoryAccessLog(memory_id=uuid.UUID(r["id"]), app_id=app.id, access_type="search",
+                                           metadata_={"query": query, "score": r.get("score"), "hash": r.get("hash")}))
             db.commit()
-
             return json.dumps({"results": results}, indent=2)
         finally:
             db.close()
@@ -249,59 +155,27 @@ async def list_memories() -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
-
-    # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
-
     try:
         db = SessionLocal()
         try:
-            # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-
-            # Get all memories
             memories = memory_client.get_all(user_id=uid)
             filtered_memories = []
-
-            # Filter memories based on permissions
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-            if isinstance(memories, dict) and 'results' in memories:
-                for memory_data in memories['results']:
-                    if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        if memory_id in accessible_memory_ids:
-                            # Create access log entry
-                            access_log = MemoryAccessLog(
-                                memory_id=memory_id,
-                                app_id=app.id,
-                                access_type="list",
-                                metadata_={
-                                    "hash": memory_data.get('hash')
-                                }
-                            )
-                            db.add(access_log)
-                            filtered_memories.append(memory_data)
-                db.commit()
-            else:
-                for memory in memories:
-                    memory_id = uuid.UUID(memory['id'])
-                    memory_obj = db.query(Memory).filter(Memory.id == memory_id).first()
-                    if memory_obj and check_memory_access_permissions(db, memory_obj, app.id):
-                        # Create access log entry
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="list",
-                            metadata_={
-                                "hash": memory.get('hash')
-                            }
-                        )
-                        db.add(access_log)
-                        filtered_memories.append(memory)
-                db.commit()
+            accessible_memory_ids = [m.id for m in user_memories if check_memory_access_permissions(db, m, app.id)]
+            items = memories.get('results', memories) if isinstance(memories, dict) else memories
+            for memory_data in items:
+                if 'id' not in memory_data:
+                    continue
+                memory_id = uuid.UUID(memory_data['id'])
+                if memory_id in accessible_memory_ids:
+                    db.add(MemoryAccessLog(memory_id=memory_id, app_id=app.id, access_type="list",
+                                           metadata_={"hash": memory_data.get('hash')}))
+                    filtered_memories.append(memory_data)
+            db.commit()
             return json.dumps(filtered_memories, indent=2)
         finally:
             db.close()
@@ -318,63 +192,34 @@ async def delete_memories(memory_ids: list[str]) -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
-
-    # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
-
     try:
         db = SessionLocal()
         try:
-            # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-
-            # Convert string IDs to UUIDs and filter accessible ones
             requested_ids = [uuid.UUID(mid) for mid in memory_ids]
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-
-            # Only delete memories that are both requested and accessible
+            accessible_memory_ids = [m.id for m in user_memories if check_memory_access_permissions(db, m, app.id)]
             ids_to_delete = [mid for mid in requested_ids if mid in accessible_memory_ids]
-
             if not ids_to_delete:
                 return "Error: No accessible memories found with provided IDs"
-
-            # Delete from vector store
             for memory_id in ids_to_delete:
                 try:
                     memory_client.delete(str(memory_id))
-                except Exception as delete_error:
-                    logging.warning(f"Failed to delete memory {memory_id} from vector store: {delete_error}")
-
-            # Update each memory's state and create history entries
+                except Exception as e:
+                    logging.warning(f"Failed to delete memory {memory_id} from vector store: {e}")
             now = datetime.datetime.now(datetime.UTC)
             for memory_id in ids_to_delete:
                 memory = db.query(Memory).filter(Memory.id == memory_id).first()
                 if memory:
-                    # Update memory state
                     memory.state = MemoryState.deleted
                     memory.deleted_at = now
-
-                    # Create history entry
-                    history = MemoryStatusHistory(
-                        memory_id=memory_id,
-                        changed_by=user.id,
-                        old_state=MemoryState.active,
-                        new_state=MemoryState.deleted
-                    )
-                    db.add(history)
-
-                    # Create access log entry
-                    access_log = MemoryAccessLog(
-                        memory_id=memory_id,
-                        app_id=app.id,
-                        access_type="delete",
-                        metadata_={"operation": "delete_by_id"}
-                    )
-                    db.add(access_log)
-
+                    db.add(MemoryStatusHistory(memory_id=memory_id, changed_by=user.id,
+                                               old_state=MemoryState.active, new_state=MemoryState.deleted))
+                    db.add(MemoryAccessLog(memory_id=memory_id, app_id=app.id, access_type="delete",
+                                           metadata_={"operation": "delete_by_id"}))
             db.commit()
             return f"Successfully deleted {len(ids_to_delete)} memories"
         finally:
@@ -392,54 +237,30 @@ async def delete_all_memories() -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
-
-    # Get memory client safely
     memory_client = get_memory_client_safe()
     if not memory_client:
         return "Error: Memory system is currently unavailable. Please try again later."
-
     try:
         db = SessionLocal()
         try:
-            # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
-
             user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-
-            # delete the accessible memories only
+            accessible_memory_ids = [m.id for m in user_memories if check_memory_access_permissions(db, m, app.id)]
             for memory_id in accessible_memory_ids:
                 try:
                     memory_client.delete(str(memory_id))
-                except Exception as delete_error:
-                    logging.warning(f"Failed to delete memory {memory_id} from vector store: {delete_error}")
-
-            # Update each memory's state and create history entries
+                except Exception as e:
+                    logging.warning(f"Failed to delete memory {memory_id} from vector store: {e}")
             now = datetime.datetime.now(datetime.UTC)
             for memory_id in accessible_memory_ids:
                 memory = db.query(Memory).filter(Memory.id == memory_id).first()
-                # Update memory state
-                memory.state = MemoryState.deleted
-                memory.deleted_at = now
-
-                # Create history entry
-                history = MemoryStatusHistory(
-                    memory_id=memory_id,
-                    changed_by=user.id,
-                    old_state=MemoryState.active,
-                    new_state=MemoryState.deleted
-                )
-                db.add(history)
-
-                # Create access log entry
-                access_log = MemoryAccessLog(
-                    memory_id=memory_id,
-                    app_id=app.id,
-                    access_type="delete_all",
-                    metadata_={"operation": "bulk_delete"}
-                )
-                db.add(access_log)
-
+                if memory:
+                    memory.state = MemoryState.deleted
+                    memory.deleted_at = now
+                    db.add(MemoryStatusHistory(memory_id=memory_id, changed_by=user.id,
+                                               old_state=MemoryState.active, new_state=MemoryState.deleted))
+                    db.add(MemoryAccessLog(memory_id=memory_id, app_id=app.id, access_type="delete_all",
+                                           metadata_={"operation": "bulk_delete"}))
             db.commit()
             return "Successfully deleted all memories"
         finally:
@@ -449,383 +270,16 @@ async def delete_all_memories() -> str:
         return f"Error deleting memories: {e}"
 
 
-def _parse_graph_attributes(attributes: str):
-    if attributes is None or attributes == "":
-        return {}
-    if isinstance(attributes, dict):
-        return attributes
-    if isinstance(attributes, str):
-        parsed = json.loads(attributes)
-        if not isinstance(parsed, dict):
-            raise ValueError("attributes must be a JSON object")
-        return parsed
-    raise ValueError("attributes must be a JSON object or string")
-
-
-def _get_graph_node_label(memory_client) -> str:
-    node_label = getattr(memory_client.graph, "node_label", "")
-    return node_label or ""
-
-def _safe_embed_text(memory_client, text: str):
-    try:
-        return memory_client.graph.embedding_model.embed(text)
-    except Exception as e:
-        logging.warning(f"Failed to embed text for graph node: {e}")
-        return None
-
-
-@mcp.tool(description="Add an entity to the knowledge graph. Used for structured knowledge like findings, components, functions, etc.")
-async def graph_add_entity(
-    name: str,
-    entity_type: str,
-    attributes: str = "{}",
-) -> str:
-    """Add an entity node to the graph."""
-    uid = user_id_var.get(None)
-    client_name = client_name_var.get(None)
-
-    if not uid or not client_name:
-        return "Error: user_id or client_name not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    entity_type = (entity_type or "").strip().lower()
-    if entity_type not in ALLOWED_ENTITY_TYPES:
-        return f"Error: Invalid entity_type. Allowed: {sorted(ALLOWED_ENTITY_TYPES)}"
-
-    try:
-        attrs = _parse_graph_attributes(attributes)
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        node_label = _get_graph_node_label(memory_client)
-        embedding = _safe_embed_text(memory_client, name)
-
-        cypher = f"""
-        MERGE (n{node_label} {{name: $name, user_id: $user_id}})
-        ON CREATE SET n.created_at = $now
-        SET n.updated_at = $now, n.entity_type = $entity_type, n += $attributes
-        SET n.embedding = coalesce(n.embedding, $embedding)
-        RETURN n.name AS name
-        """
-        memory_client.graph.graph.query(
-            cypher,
-            params={
-                "name": name,
-                "user_id": uid,
-                "entity_type": entity_type,
-                "attributes": attrs,
-                "now": now,
-                "embedding": embedding,
-            },
-        )
-
-        return json.dumps({"status": "success", "entity": name, "type": entity_type})
-    except Exception as e:
-        logging.exception(f"Error adding entity to graph: {e}")
-        return f"Error adding entity: {e}"
-
-
-@mcp.tool(description="Add a relationship between two entities in the knowledge graph.")
-async def graph_add_relation(
-    from_entity: str,
-    to_entity: str,
-    relation_type: str,
-    attributes: str = "{}",
-) -> str:
-    """Add a relationship between entities."""
-    uid = user_id_var.get(None)
-    if not uid:
-        return "Error: user_id not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    relation_type = (relation_type or "").strip().lower()
-    if relation_type not in ALLOWED_RELATION_TYPES:
-        return f"Error: Invalid relation_type. Allowed: {sorted(ALLOWED_RELATION_TYPES)}"
-
-    try:
-        attrs = _parse_graph_attributes(attributes)
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        node_label = _get_graph_node_label(memory_client)
-        from_embedding = _safe_embed_text(memory_client, from_entity)
-        to_embedding = _safe_embed_text(memory_client, to_entity)
-
-        cypher = f"""
-        MERGE (a{node_label} {{name: $from_entity, user_id: $user_id}})
-        ON CREATE SET a.created_at = $now
-        SET a.updated_at = $now
-        SET a.embedding = coalesce(a.embedding, $from_embedding)
-        MERGE (b{node_label} {{name: $to_entity, user_id: $user_id}})
-        ON CREATE SET b.created_at = $now
-        SET b.updated_at = $now
-        SET b.embedding = coalesce(b.embedding, $to_embedding)
-        MERGE (a)-[r:{relation_type}]->(b)
-        ON CREATE SET r.created_at = $now
-        SET r.updated_at = $now, r += $attributes
-        RETURN type(r) AS relation
-        """
-        memory_client.graph.graph.query(
-            cypher,
-            params={
-                "from_entity": from_entity,
-                "to_entity": to_entity,
-                "user_id": uid,
-                "attributes": attrs,
-                "now": now,
-                "from_embedding": from_embedding,
-                "to_embedding": to_embedding,
-            },
-        )
-
-        return json.dumps(
-            {
-                "status": "success",
-                "from": from_entity,
-                "to": to_entity,
-                "type": relation_type,
-            }
-        )
-    except Exception as e:
-        logging.exception(f"Error adding relation to graph: {e}")
-        return f"Error adding relation: {e}"
-
-
-@mcp.tool(description="Query the knowledge graph for entities and their relationships.")
-async def graph_query(
-    query: str,
-    limit: int = 10,
-) -> str:
-    """Query graph for entities and relations."""
-    uid = user_id_var.get(None)
-    if not uid:
-        return "Error: user_id not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    if not query:
-        return "Error: query is required"
-
-    try:
-        result = memory_client.graph.search(query, {"user_id": uid}, limit=limit)
-        if result:
-            return json.dumps(result, indent=2)
-
-        node_label = _get_graph_node_label(memory_client)
-        cypher = f"""
-        MATCH (n{node_label} {{user_id: $user_id}})
-        WHERE toLower(n.name) CONTAINS toLower($query)
-        OPTIONAL MATCH (n)-[r]->(m{node_label} {{user_id: $user_id}})
-        RETURN n.name AS source, type(r) AS relationship, m.name AS destination
-        LIMIT $limit
-        """
-        fallback = memory_client.graph.graph.query(
-            cypher,
-            params={"user_id": uid, "query": query, "limit": limit},
-        )
-        return json.dumps(fallback, indent=2)
-    except Exception as e:
-        logging.exception(f"Error querying graph: {e}")
-        return f"Error querying graph: {e}"
-
-
-@mcp.tool(description="Delete entities from the knowledge graph.")
-async def graph_delete_entity(
-    entity_name: str,
-) -> str:
-    """Delete an entity from the graph."""
-    uid = user_id_var.get(None)
-    if not uid:
-        return "Error: user_id not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    if not entity_name:
-        return "Error: entity_name is required"
-
-    try:
-        node_label = _get_graph_node_label(memory_client)
-        count_query = f"""
-        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
-        RETURN count(n) AS count
-        """
-        count_result = memory_client.graph.graph.query(
-            count_query,
-            params={"name": entity_name, "user_id": uid},
-        )
-        count = count_result[0]["count"] if count_result else 0
-
-        if count == 0:
-            return json.dumps({"status": "not_found", "deleted": 0, "entity": entity_name})
-
-        delete_query = f"""
-        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
-        DETACH DELETE n
-        """
-        memory_client.graph.graph.query(
-            delete_query,
-            params={"name": entity_name, "user_id": uid},
-        )
-
-        return json.dumps({"status": "success", "deleted": count, "entity": entity_name})
-    except Exception as e:
-        logging.exception(f"Error deleting from graph: {e}")
-        return f"Error deleting entity: {e}"
-
-
-@mcp.tool(description="Update attributes for an existing graph entity.")
-async def graph_update_entity(
-    name: str,
-    attributes: str = "{}",
-) -> str:
-    """Update an entity's attributes (partial update)."""
-    uid = user_id_var.get(None)
-    if not uid:
-        return "Error: user_id not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    if not name:
-        return "Error: name is required"
-
-    try:
-        attrs = _parse_graph_attributes(attributes)
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        node_label = _get_graph_node_label(memory_client)
-        embedding = _safe_embed_text(memory_client, name)
-
-        cypher = f"""
-        MATCH (n{node_label} {{name: $name, user_id: $user_id}})
-        SET n.updated_at = $now, n += $attributes
-        SET n.embedding = coalesce(n.embedding, $embedding)
-        RETURN n.name AS name
-        """
-        result = memory_client.graph.graph.query(
-            cypher,
-            params={
-                "name": name,
-                "user_id": uid,
-                "attributes": attrs,
-                "now": now,
-                "embedding": embedding,
-            },
-        )
-
-        if not result:
-            return json.dumps({"status": "not_found", "updated": 0, "entity": name})
-
-        return json.dumps({"status": "success", "updated": 1, "entity": name})
-    except Exception as e:
-        logging.exception(f"Error updating graph entity: {e}")
-        return f"Error updating entity: {e}"
-
-
-@mcp.tool(description="Backfill missing embeddings for graph entities.")
-async def graph_backfill_embeddings(
-    entity_type: str = None,
-    limit: int = 200,
-) -> str:
-    """Populate missing embeddings for existing nodes."""
-    uid = user_id_var.get(None)
-    if not uid:
-        return "Error: user_id not provided"
-
-    memory_client = get_memory_client_safe()
-    if not memory_client or not memory_client.enable_graph:
-        return "Error: Graph memory is not enabled"
-
-    if limit <= 0:
-        return "Error: limit must be > 0"
-
-    if entity_type:
-        entity_type = entity_type.strip().lower()
-        if entity_type not in ALLOWED_ENTITY_TYPES:
-            return f"Error: Invalid entity_type. Allowed: {sorted(ALLOWED_ENTITY_TYPES)}"
-
-    try:
-        node_label = _get_graph_node_label(memory_client)
-        cypher = f"""
-        MATCH (n{node_label} {{user_id: $user_id}})
-        WHERE n.embedding IS NULL
-        {("AND n.entity_type = $entity_type" if entity_type else "")}
-        RETURN n.name AS name
-        LIMIT $limit
-        """
-        rows = memory_client.graph.graph.query(
-            cypher,
-            params={"user_id": uid, "entity_type": entity_type, "limit": limit},
-        )
-
-        updated = 0
-        for row in rows:
-            name = row.get("name")
-            if not name:
-                continue
-            embedding = _safe_embed_text(memory_client, name)
-            if embedding is None:
-                continue
-            update_cypher = f"""
-            MATCH (n{node_label} {{name: $name, user_id: $user_id}})
-            SET n.embedding = $embedding, n.updated_at = $now
-            RETURN n.name AS name
-            """
-            memory_client.graph.graph.query(
-                update_cypher,
-                params={
-                    "name": name,
-                    "user_id": uid,
-                    "embedding": embedding,
-                    "now": datetime.datetime.now(datetime.UTC).isoformat(),
-                },
-            )
-            updated += 1
-
-        return json.dumps(
-            {
-                "status": "success",
-                "updated": updated,
-                "requested": len(rows),
-                "entity_type": entity_type,
-            }
-        )
-    except Exception as e:
-        logging.exception(f"Error backfilling embeddings: {e}")
-        return f"Error backfilling embeddings: {e}"
-
 @mcp_router.get("/{client_name}/sse/{user_id}")
 async def handle_sse(request: Request):
-    """Handle SSE connections for a specific user and client"""
-    # Extract user_id and client_name from path parameters
     uid = request.path_params.get("user_id")
     user_token = user_id_var.set(uid or "")
     client_name = request.path_params.get("client_name")
     client_token = client_name_var.set(client_name or "")
-
     try:
-        # NOTE: request._send is the raw ASGI `send` callable. Starlette does not
-        # expose it publicly, but the MCP SDK transports require the raw ASGI
-        # interface (scope, receive, send). This is the standard pattern from the
-        # MCP Python SDK examples.
-        async with sse.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,
-        ) as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
+        async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+            await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
     finally:
-        # Clean up context variables
         user_id_var.reset(user_token)
         client_name_var.reset(client_token)
 
@@ -836,26 +290,18 @@ async def handle_get_message(request: Request):
 
 
 @mcp_router.post("/{client_name}/sse/{user_id}/messages/")
-async def handle_post_message(request: Request):
+async def handle_post_message_route(request: Request):
     return await handle_post_message(request)
 
+
 async def handle_post_message(request: Request):
-    """Handle POST messages for SSE"""
     try:
         body = await request.body()
-
-        # Create a simple receive function that returns the body
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
-
-        # Create a simple send function that does nothing
         async def send(message):
             return {}
-
-        # Call handle_post_message with the correct arguments
         await sse.handle_post_message(request.scope, receive, send)
-
-        # Return a success response
         return {"status": "ok"}
     finally:
         pass
@@ -863,25 +309,12 @@ async def handle_post_message(request: Request):
 
 @mcp_router.api_route("/{client_name}/http/{user_id}", methods=["POST", "GET", "DELETE"])
 async def handle_streamable_http(request: Request):
-    """Handle Streamable HTTP connections for a specific user and client.
-
-    Uses the Streamable HTTP transport (MCP spec 2025-03-26+) which replaces
-    the deprecated SSE transport. Runs in stateless mode — each request is
-    handled independently with no persistent session.
-
-    The transport writes its response directly to the ASGI ``send`` callable.
-    We intercept it via ``capture_send`` so we can return a proper ``Response``
-    to FastAPI — otherwise FastAPI would also try to send its own response,
-    causing a "double-response" bug.
-    """
+    """Streamable HTTP transport (MCP spec 2025-03-26+). Stateless mode."""
     uid = request.path_params.get("user_id")
     user_token = user_id_var.set(uid or "")
     client_name = request.path_params.get("client_name")
     client_token = client_name_var.set(client_name or "")
 
-    # Intercept the ASGI messages the transport sends so we can return them
-    # as a single Response to FastAPI.  Without this, FastAPI would attempt to
-    # write its own response after the transport already wrote one.
     response_started = False
     response_status = 200
     response_headers: list[tuple[bytes, bytes]] = []
@@ -897,23 +330,13 @@ async def handle_streamable_http(request: Request):
             response_body.extend(message.get("body", b""))
 
     try:
-        transport = StreamableHTTPServerTransport(
-            mcp_session_id=None,
-            is_json_response_enabled=True,
-        )
-
+        transport = StreamableHTTPServerTransport(mcp_session_id=None, is_json_response_enabled=True)
         async with anyio.create_task_group() as tg:
-
             async def run_server(*, task_status=anyio.TASK_STATUS_IGNORED):
                 async with transport.connect() as (read_stream, write_stream):
                     task_status.started()
-                    await mcp._mcp_server.run(
-                        read_stream,
-                        write_stream,
-                        mcp._mcp_server.create_initialization_options(),
-                        stateless=True,
-                    )
-
+                    await mcp._mcp_server.run(read_stream, write_stream,
+                                              mcp._mcp_server.create_initialization_options(), stateless=True)
             await tg.start(run_server)
             await transport.handle_request(request.scope, request.receive, capture_send)
             await transport.terminate()
@@ -925,18 +348,10 @@ async def handle_streamable_http(request: Request):
     if not response_started:
         return Response(status_code=500, content=b"Transport did not produce a response")
 
-    # Header dict conversion is safe here: the MCP transport in stateless JSON
-    # mode only emits single-valued headers (Content-Type, Content-Length).
-    return Response(
-        content=bytes(response_body),
-        status_code=response_status,
-        headers={k.decode(): v.decode() for k, v in response_headers},
-    )
+    return Response(content=bytes(response_body), status_code=response_status,
+                    headers={k.decode(): v.decode() for k, v in response_headers})
 
 
 def setup_mcp_server(app: FastAPI):
-    """Setup MCP server with the FastAPI application"""
     mcp._mcp_server.name = "mem0-mcp-server"
-
-    # Include MCP router in the FastAPI app
     app.include_router(mcp_router)
