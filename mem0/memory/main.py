@@ -445,7 +445,11 @@ class Memory(MemoryBase):
             concurrent.futures.wait([future1, future2])
 
             vector_store_result = future1.result()
-            graph_result = future2.result()
+            try:
+                graph_result = future2.result()
+            except Exception as e:
+                logger.warning(f"Graph store operation failed, continuing without graph results: {e}")
+                graph_result = []
 
         if self.enable_graph:
             return {
@@ -793,7 +797,11 @@ class Memory(MemoryBase):
             )
 
             all_memories_result = future_memories.result()
-            graph_entities_result = future_graph_entities.result() if future_graph_entities else None
+            try:
+                graph_entities_result = future_graph_entities.result() if future_graph_entities else None
+            except Exception as e:
+                logger.warning(f"Graph store get_all failed, continuing without graph results: {e}")
+                graph_entities_result = None
 
         if self.enable_graph:
             return {"results": all_memories_result, "relations": graph_entities_result}
@@ -932,7 +940,11 @@ class Memory(MemoryBase):
             )
 
             original_memories = future_memories.result()
-            graph_entities = future_graph_entities.result() if future_graph_entities else None
+            try:
+                graph_entities = future_graph_entities.result() if future_graph_entities else None
+            except Exception as e:
+                logger.warning(f"Graph store search failed, continuing without graph results: {e}")
+                graph_entities = None
 
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
