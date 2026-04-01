@@ -16,7 +16,7 @@ import traceback
 import aiohttp
 import concurrent.futures
 
-SSE_URL = "http://localhost:8765/mcp/claude-desktop/sse/martinm"
+SSE_URL = "http://localhost:8765/mcp/claude-desktop/sse/your-username"
 MAX_RECONNECT_ATTEMPTS = 10
 INITIAL_BACKOFF = 1  # seconds
 MAX_BACKOFF = 30  # seconds

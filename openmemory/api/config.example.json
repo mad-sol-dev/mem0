@@ -22,7 +22,7 @@
       "provider": "qdrant",
       "config": {
         "collection_name": "openmemory",
-        "url": "http://10.8.0.1:6333",
+        "url": "http://your-qdrant-host:6333",
         "api_key": "",
         "embedding_model_dims": 1024
       }

@@ -199,3 +199,7 @@ qdrant_storage/
 .crossnote
 testing.ipynb
 .aider*
+
+# Local test/setup scripts (contain environment-specific config)
+test_qdrant.py
+test_setup.py
